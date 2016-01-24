@@ -23,6 +23,8 @@
 #include <malloc.h>
 #include <signal.h>
 #include <poll.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
@@ -165,6 +167,9 @@ struct _Process {
     /* static buffers */
     struct tm timeBuffer;
 
+    /* to avoid glib recursive log errors */
+    GQueue* cachedWarningMessages;
+
     gint referenceCount;
     MAGIC_DECLARE;
 };
@@ -215,6 +220,16 @@ Process* process_new(gpointer host, GQuark programID, guint processID,
     return proc;
 }
 
+static void _process_logCachedWarnings(Process* proc) {
+    if(proc->cachedWarningMessages) {
+        gchar* msgStr = NULL;
+        while((msgStr = g_queue_pop_head(proc->cachedWarningMessages)) != NULL) {
+            warning(msgStr);
+            g_free(msgStr);
+        }
+    }
+}
+
 static void _process_free(Process* proc) {
     MAGIC_ASSERT(proc);
 
@@ -238,6 +253,11 @@ static void _process_free(Process* proc) {
         proc->stderrFile = NULL;
     }
 
+    if(proc->cachedWarningMessages) {
+        _process_logCachedWarnings(proc);
+        g_queue_free(proc->cachedWarningMessages);
+    }
+
     g_timer_destroy(proc->cpuDelayTimer);
 
     MAGIC_CLEAR(proc);
@@ -251,6 +271,19 @@ static FILE* _process_openFile(Process* proc, const gchar* prefix) {
     gchar* pathStr = g_build_filename(hostDataPath, fileNameString->str, NULL);
     FILE* f = g_fopen(pathStr, "a");
     g_string_free(fileNameString, TRUE);
+    if(!f) {
+        /* if we log as normal, glib will freak out about recursion if the plugin was trying to log with glib */
+        if(!proc->cachedWarningMessages) {
+            proc->cachedWarningMessages = g_queue_new();
+        }
+        GString* stringBuffer = g_string_new(NULL);
+        g_string_printf(stringBuffer, "process '%s-%u': unable to open file '%s', error was: %s",
+                g_quark_to_string(proc->programID), proc->processID, pathStr, g_strerror(errno));
+        g_queue_push_tail(proc->cachedWarningMessages, g_string_free(stringBuffer, FALSE));
+
+//        warning("process '%s-%u': unable to open file '%s', error was: %s",
+//                g_quark_to_string(proc->programID), proc->processID, pathStr, g_strerror(errno));
+    }
     g_free(pathStr);
     return f;
 }
@@ -262,11 +295,37 @@ static FILE* _process_getIOFile(Process* proc, gint fd){
     if(fd == STDOUT_FILENO) {
         if(!proc->stdoutFile) {
             proc->stdoutFile = _process_openFile(proc, "stdout");
+            if(!proc->stdoutFile) {
+                /* if we log as normal, glib will freak out about recursion if the plugin was trying to log with glib */
+                if(!proc->cachedWarningMessages) {
+                    proc->cachedWarningMessages = g_queue_new();
+                }
+                GString* stringBuffer = g_string_new(NULL);
+                g_string_printf(stringBuffer, "process '%s-%u': unable to open file for process output, dumping to tty stdout",
+                    g_quark_to_string(proc->programID), proc->processID);
+                g_queue_push_tail(proc->cachedWarningMessages, g_string_free(stringBuffer, FALSE));
+
+                /* now set shadows stdout */
+                proc->stdoutFile = stdout;
+            }
         }
         return proc->stdoutFile;
     } else {
         if(!proc->stderrFile) {
             proc->stderrFile = _process_openFile(proc, "stderr");
+            if(!proc->stderrFile) {
+                /* if we log as normal, glib will freak out about recursion if the plugin was trying to log with glib */
+                if(!proc->cachedWarningMessages) {
+                    proc->cachedWarningMessages = g_queue_new();
+                }
+                GString* stringBuffer = g_string_new(NULL);
+                g_string_printf(stringBuffer, "process '%s-%u': unable to open file for process errors, dumping to tty stderr",
+                        g_quark_to_string(proc->programID), proc->processID);
+                g_queue_push_tail(proc->cachedWarningMessages, g_string_free(stringBuffer, FALSE));
+
+                /* now set shadows stderr */
+                proc->stderrFile = stderr;
+            }
         }
         return proc->stderrFile;
     }
@@ -651,6 +710,9 @@ void process_start(Process* proc) {
     if(proc->stderrFile) {
         fflush(proc->stderrFile);
     }
+    if(proc->cachedWarningMessages) {
+        _process_logCachedWarnings(proc);
+    }
 
     /* cleanup */
     g_string_free(shadowThreadNameBuf, TRUE);
@@ -700,6 +762,10 @@ void process_continue(Process* proc) {
     _process_changeContext(proc, PCTX_PTH, PCTX_SHADOW);
     program_swapOutState(proc->prog, proc->pstate);
     worker_setActiveProcess(NULL);
+
+    if(proc->cachedWarningMessages) {
+        _process_logCachedWarnings(proc);
+    }
 
     if(proc->programMainThread) {
         info("'%s-%u' is running, but threads are blocked waiting for events", g_quark_to_string(proc->programID), proc->processID);
@@ -2224,6 +2290,54 @@ int process_emu_pipe2(Process* proc, int pipefds[2], int flags) {
 
 int process_emu_pipe(Process* proc, int pipefds[2]) {
     return process_emu_pipe2(proc, pipefds, O_NONBLOCK);
+}
+
+int process_emu_getifaddrs(Process* proc, struct ifaddrs **ifap) {
+    if(!ifap) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    /* we always have loopback */
+    struct ifaddrs *i = g_new0(struct ifaddrs, 1);
+    i->ifa_flags = (IFF_UP | IFF_RUNNING | IFF_LOOPBACK);
+    i->ifa_name = g_strdup("lo");
+
+    i->ifa_addr = g_new0(struct sockaddr, 1);
+    i->ifa_addr->sa_family = AF_INET;
+    ((struct sockaddr_in *) i->ifa_addr)->sin_addr.s_addr = address_stringToIP("127.0.0.1");
+
+    /* add the default net address */
+    Address* defaultAddress = host_getDefaultAddress(proc->host);
+    if(defaultAddress != NULL) {
+        struct ifaddrs *j = g_new0(struct ifaddrs, 1);
+        j->ifa_flags = (IFF_UP | IFF_RUNNING);
+        j->ifa_name = g_strdup("eth0");
+
+        j->ifa_addr = g_new0(struct sockaddr, 1);
+        j->ifa_addr->sa_family = AF_INET;
+        ((struct sockaddr_in *) j->ifa_addr)->sin_addr.s_addr = (in_addr_t)address_toNetworkIP(defaultAddress);
+
+        i->ifa_next = j;
+    }
+
+    *ifap = i;
+    return 0;
+}
+
+void process_emu_freeifaddrs(Process* proc, struct ifaddrs *ifa) {
+    struct ifaddrs* iter = ifa;
+    while(iter != NULL) {
+        struct ifaddrs* next = iter->ifa_next;
+        if(iter->ifa_addr) {
+            g_free(iter->ifa_addr);
+        }
+        if(iter->ifa_name) {
+            g_free(iter->ifa_name);
+        }
+        g_free(iter);
+        iter = next;
+    }
 }
 
 /* polling */

@@ -189,6 +189,40 @@ static gboolean _tgengraph_hasSelfLoop(TGenGraph* g, igraph_integer_t vertexInde
     return isLoop;
 }
 
+static glong _tgengraph_countIncomingEdges(TGenGraph* g, igraph_integer_t vertexIndex) {
+    /* Count up the total number of incoming edges */
+
+    /* initialize a vector to hold the result neighbor vertices for this action */
+    igraph_vector_t* resultNeighborVertices = g_new0(igraph_vector_t, 1);
+
+    /* initialize with 0 entries, since we dont know how many neighbors we have */
+    gint result = igraph_vector_init(resultNeighborVertices, 0);
+    if(result != IGRAPH_SUCCESS) {
+        tgen_critical("igraph_vector_init return non-success code %i", result);
+        g_free(resultNeighborVertices);
+        return -1;
+    }
+
+    /* now get all incoming 1-hop neighbors of the given action */
+    result = igraph_neighbors(g->graph, resultNeighborVertices, vertexIndex, IGRAPH_IN);
+    if(result != IGRAPH_SUCCESS) {
+        tgen_critical("igraph_neighbors return non-success code %i", result);
+        igraph_vector_destroy(resultNeighborVertices);
+        g_free(resultNeighborVertices);
+        return -1;
+    }
+
+    /* handle the results */
+    glong totalIncoming = igraph_vector_size(resultNeighborVertices);
+    tgen_debug("found %li incoming 1-hop neighbors to vertex %i", totalIncoming, (gint)vertexIndex);
+
+    /* cleanup */
+    igraph_vector_destroy(resultNeighborVertices);
+    g_free(resultNeighborVertices);
+
+    return totalIncoming;
+}
+
 static GError* _tgengraph_parseStartVertex(TGenGraph* g, const gchar* idStr,
         igraph_integer_t vertexIndex) {
     TGEN_ASSERT(g);
@@ -274,54 +308,14 @@ static GError* _tgengraph_parsePauseVertex(TGenGraph* g, const gchar* idStr,
     tgen_debug("found vertex %li (%s), time=%s", (glong)vertexIndex, idStr, timeStr);
 
     GError* error = NULL;
-    TGenAction* a = tgenaction_newPauseAction(timeStr, &error);
 
-    if(a) {
-        _tgengraph_storeAction(g, a, vertexIndex);
+    glong totalIncoming = _tgengraph_countIncomingEdges(g, vertexIndex);
+    if(totalIncoming <= 0) {
+        tgen_error("the number of incoming edges on vertex %i must be positive", (gint)vertexIndex);
+        g_assert(totalIncoming > 0);
     }
 
-    return error;
-}
-
-static GError* _tgengraph_parseSynchronizeVertex(TGenGraph* g, const gchar* idStr,
-        igraph_integer_t vertexIndex) {
-    TGEN_ASSERT(g);
-
-    tgen_debug("found vertex %li (%s)", (glong)vertexIndex, idStr);
-
-    /* Count up the total incoming edges */
-
-    /* initialize a vector to hold the result neighbor vertices for this action */
-    igraph_vector_t* resultNeighborVertices = g_new0(igraph_vector_t, 1);
-
-    /* initialize with 0 entries, since we dont know how many neighbors we have */
-    gint result = igraph_vector_init(resultNeighborVertices, 0);
-    if(result != IGRAPH_SUCCESS) {
-        tgen_critical("igraph_vector_init return non-success code %i", result);
-        g_free(resultNeighborVertices);
-        return FALSE;
-    }
-
-    /* now get all incoming 1-hop neighbors of the given action */
-    result = igraph_neighbors(g->graph, resultNeighborVertices, vertexIndex, IGRAPH_IN);
-    if(result != IGRAPH_SUCCESS) {
-        tgen_critical("igraph_neighbors return non-success code %i", result);
-        igraph_vector_destroy(resultNeighborVertices);
-        g_free(resultNeighborVertices);
-        return NULL;
-    }
-
-    /* handle the results */
-    glong totalIncoming = igraph_vector_size(resultNeighborVertices);
-    tgen_debug("found %li neighbors to vertex %i", totalIncoming, (gint)vertexIndex);
-
-    /* cleanup */
-    igraph_vector_destroy(resultNeighborVertices);
-    g_free(resultNeighborVertices);
-
-    GError* error = NULL;
-    TGenAction* a = tgenaction_newSynchronizeAction(totalIncoming, &error);
-
+    TGenAction* a = tgenaction_newPauseAction(timeStr, totalIncoming, &error);
     if(a) {
         _tgengraph_storeAction(g, a, vertexIndex);
     }
@@ -399,8 +393,6 @@ static GError* _tgengraph_parseGraphVertices(TGenGraph* g) {
             error = _tgengraph_parseEndVertex(g, idStr, vertexIndex);
         } else if(g_strstr_len(idStr, (gssize)-1, "pause")) {
             error = _tgengraph_parsePauseVertex(g, idStr, vertexIndex);
-        } else if(g_strstr_len(idStr, (gssize)-1, "synchronize")) {
-            error = _tgengraph_parseSynchronizeVertex(g, idStr, vertexIndex);
         } else if(g_strstr_len(idStr, (gssize)-1, "transfer")) {
             error = _tgengraph_parseTransferVertex(g, idStr, vertexIndex);
         } else {
@@ -642,7 +634,9 @@ TGenGraph* tgengraph_new(gchar* path) {
     }
 
     if(!error && g->graphPath) {
+#if 1//!defined(IGRAPH_THREAD_SAFE) || (defined(IGRAPH_THREAD_SAFE) && IGRAPH_THREAD_SAFE == 0)
         tgen_lock();
+#endif
         /* use the built-in C attribute handler */
         igraph_attribute_table_t* oldHandler = igraph_i_set_attribute_table(&igraph_cattribute_table);
 
@@ -665,7 +659,9 @@ TGenGraph* tgengraph_new(gchar* path) {
 
         /* replace the old handler */
         igraph_i_set_attribute_table(oldHandler);
+#if 1//!defined(IGRAPH_THREAD_SAFE) || (defined(IGRAPH_THREAD_SAFE) && IGRAPH_THREAD_SAFE == 0)
         tgen_unlock();
+#endif
     }
 
     if(error) {
@@ -720,7 +716,7 @@ GQueue* tgengraph_getNextActions(TGenGraph* g, TGenAction* action) {
 
     /* handle the results */
     glong nVertices = igraph_vector_size(resultNeighborVertices);
-    tgen_debug("found %li neighbors to vertex %i", nVertices, (gint)srcVertexIndex);
+    tgen_debug("found %li outgoing neighbors from vertex %i", nVertices, (gint)srcVertexIndex);
 
     /* only follow one edge of all edges with the 'weight' attribute (do a weighted choice)
      * but follow all edges without the 'weight' attribute */
@@ -734,37 +730,43 @@ GQueue* tgengraph_getNextActions(TGenGraph* g, TGenAction* action) {
         igraph_integer_t dstVertexIndex = igraph_vector_e(resultNeighborVertices, i);
 
         TGenAction* nextAction = _tgengraph_getAction(g, dstVertexIndex);
-        if(nextAction) {
-            /* get edge id so we can check for weight */
-            igraph_integer_t edgeIndex = 0;
-            result = igraph_get_eid(g->graph, &edgeIndex, srcVertexIndex, dstVertexIndex, IGRAPH_DIRECTED, TRUE);
-            if(result != IGRAPH_SUCCESS) {
-                tgen_critical("igraph_get_eid return non-success code %i", result);
-                igraph_vector_destroy(resultNeighborVertices);
-                g_free(resultNeighborVertices);
-                g_queue_free(nextActions);
-                g_queue_free(chooseActions);
-                g_queue_free(chooseWeights);
-                return NULL;
-            }
+        if(!nextAction) {
+            tgen_debug("src vertex %i dst vertex %i, next action is null", (gint)srcVertexIndex, (gint)dstVertexIndex);
+            continue;
+        }
 
-            /* check for a weight on the edge */
-            gdouble* weightPtr = _tgengraph_getWeight(g, edgeIndex);
+        /* get edge id so we can check for weight */
+        igraph_integer_t edgeIndex = 0;
+        result = igraph_get_eid(g->graph, &edgeIndex, srcVertexIndex, dstVertexIndex, IGRAPH_DIRECTED, TRUE);
+        if(result != IGRAPH_SUCCESS) {
+            tgen_critical("igraph_get_eid return non-success code %i", result);
+            igraph_vector_destroy(resultNeighborVertices);
+            g_free(resultNeighborVertices);
+            g_queue_free(nextActions);
+            g_queue_free(chooseActions);
+            g_queue_free(chooseWeights);
+            return NULL;
+        }
 
-            if(weightPtr) {
-                /* we will only choose one of all with weights */
-                totalWeight += (gdouble) *weightPtr;
-                g_queue_push_tail(chooseWeights, weightPtr);
-                g_queue_push_tail(chooseActions, nextAction);
-            } else {
-                /* no weight, always add it */
-                g_queue_push_tail(nextActions, nextAction);
-            }
+        /* check for a weight on the edge */
+        gdouble* weightPtr = _tgengraph_getWeight(g, edgeIndex);
+
+        if(weightPtr) {
+            /* we will only choose one of all with weights */
+            totalWeight += (gdouble) *weightPtr;
+            g_queue_push_tail(chooseWeights, weightPtr);
+            g_queue_push_tail(chooseActions, nextAction);
+        } else {
+            /* no weight, always add it */
+            g_queue_push_tail(nextActions, nextAction);
         }
     }
 
     /* choose only one from 'choices' and add it to the next queue */
-    if(g_queue_get_length(chooseActions) > 0) {
+    guint numChoices = g_queue_get_length(chooseActions);
+    if(numChoices > 0) {
+        tgen_debug("src vertex %i, choosing among %u weighted outgoing edges", (gint)srcVertexIndex, numChoices);
+
         /* count up weights until the cumulative exceeds the random choice */
         gdouble cumulativeWeight = 0.0;
         guint choicePosition = 0;
@@ -789,6 +791,8 @@ GQueue* tgengraph_getNextActions(TGenGraph* g, TGenAction* action) {
     g_free(resultNeighborVertices);
     g_queue_free(chooseActions);
     g_queue_free(chooseWeights);
+
+    tgen_debug("src vertex %i, we have %u next actions", (gint)srcVertexIndex, g_queue_get_length(nextActions));
 
     return nextActions;
 }
